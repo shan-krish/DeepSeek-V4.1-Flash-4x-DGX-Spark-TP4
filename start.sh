@@ -161,6 +161,7 @@ LOG_DIR="${LOG_DIR:-$ROOT/logs}"
 SERVE_LOG="${SERVE_LOG:-$LOG_DIR/dsv41.log}"
 REMOTE_PY="$ROOT/scripts/remote.py"
 NFS_VOLUME="${NFS_VOLUME:-dsv41-weights}"
+ABLIT_HOST_DIR="${DSV41_ABLIT_DIR:-$HOME/models/ablit-dual}"
 NFS_SHARE="${NFS_SHARE:-1}"
 
 _abs() { readlink -f "$1" 2>/dev/null || echo "$1"; }
@@ -323,6 +324,9 @@ docker_common_args() {
     -e "SPEC_ALGO=$SPEC_ALGO"
     -e "DSPARK_BLOCK_SIZE=$DSPARK_BLOCK_SIZE"
     -e "SERVED_MODEL_NAME=$SERVED_MODEL_NAME"
+    -v "$ABLIT_HOST_DIR:/ablit:ro"
+    -e "DSV41_DUAL_VARIANT=${DSV41_DUAL_VARIANT:-0}"
+    -e "DSV41_ABLIT_DIR=/ablit"
     -e "SKIP_PREPARE=$SKIP_PREPARE"
     -e "SKIP_VERIFY=$SKIP_VERIFY"
     -e "WARMUP=${WARMUP:-1}"
@@ -375,6 +379,8 @@ docker_common_args() {
   if [[ -n "${EXTRA_CONTAINER_ENV:-}" ]]; then
     local _kv
     for _kv in ${EXTRA_CONTAINER_ENV}; do _a+=(-e "$_kv"); done
+    # Explicit override wins over EXTRA_CONTAINER_ENV (later -e wins in docker run).
+    [[ -z "${DSV41_PREFILL_SP:-}" ]] || _a+=(-e "DSV41_PREFILL_SP=$DSV41_PREFILL_SP")
   fi
   if [[ "$NCCL_SWITCHLESS_RING_ONLY" == "1" ]]; then
     switchless_ring_args _a
@@ -415,6 +421,7 @@ worker_env_lines() {
   local _extra_env="-e DSV41_EXTRA_ENV=1" _kv
   [[ "${DSV41_TRITON_CACHE:-0}" != 1 ]] || _extra_env+=" -e TRITON_CACHE_DIR=/state/triton"
   for _kv in ${EXTRA_CONTAINER_ENV:-}; do _extra_env+=" -e $(printf '%q' "$_kv")"; done
+  [[ -z "${DSV41_PREFILL_SP:-}" ]] || _extra_env+=" -e DSV41_PREFILL_SP=$(printf '%q' "$DSV41_PREFILL_SP")"
   # Ring environment is mirrored to every rank. The leading space comes from here,
   # not from switchless_ring_env_string, so that with the switch off this line is
   # byte-identical to before it existed.
@@ -444,6 +451,9 @@ worker_env_lines() {
         -e CUDA_GRAPH_MAX_BS_DECODE=$MAX_RUNNING_REQUESTS \\
         -e SPEC_ALGO=$SPEC_ALGO -e DSPARK_BLOCK_SIZE=$DSPARK_BLOCK_SIZE \\
         -e SERVED_MODEL_NAME=$SERVED_MODEL_NAME \\
+        -v $ABLIT_HOST_DIR:/ablit:ro \\
+        -e DSV41_DUAL_VARIANT=${DSV41_DUAL_VARIANT:-0} \\
+        -e DSV41_ABLIT_DIR=/ablit \\
         -e SKIP_PREPARE=1 -e SKIP_VERIFY=1 -e SKIP_SMOKE=1 \\
         -e NCCL_NET=$NCCL_NET -e NCCL_IB_DISABLE=$NCCL_IB_DISABLE \\
         -e NCCL_IB_HCA=$IB_HCA -e NCCL_SOCKET_IFNAME=$NCCL_SOCKET_IFNAME \\
@@ -878,6 +888,7 @@ $(worker_env_lines "$wip" "$wgid" "$rank")
 
   _dump_head_fail() {
     _stop_logtail
+    cp -a "$SERVE_LOG" "$LOG_DIR/fail-$(date +%Y%m%d-%H%M%S).log" 2>/dev/null || true
     trap - EXIT
     local st oom errstr
     st=$(docker inspect -f '{{.State.Status}}' "$HEAD_CTN" 2>/dev/null || echo missing)

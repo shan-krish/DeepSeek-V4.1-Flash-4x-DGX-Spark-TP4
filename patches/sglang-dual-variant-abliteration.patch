@@ -1,0 +1,673 @@
+diff -ruN '--exclude=__pycache__' a/srt/entrypoints/http_server.py b/srt/entrypoints/http_server.py
+--- a/srt/entrypoints/http_server.py	2026-10-27 00:51:37.902544571 -0700
++++ b/srt/entrypoints/http_server.py	2026-10-27 00:51:37.905561266 -0700
+@@ -1862,6 +1862,10 @@
+ async def available_models():
+     """Show available models. OpenAI-compatible endpoint."""
+     served_model_names = [_global_state.tokenizer_manager.served_model_name]
++    if os.environ.get("DSV41_DUAL_VARIANT", "0") not in ("", "0", "false", "False"):
++        # One server serves both variants; advertise the second name so OpenAI
++        # clients can select it through `model`.
++        served_model_names.append("DeepSeek-v4.1-Flash-Abliterated")
+     model_cards = []
+ 
+     # Add base model
+diff -ruN '--exclude=__pycache__' a/srt/entrypoints/openai/serving_chat.py b/srt/entrypoints/openai/serving_chat.py
+--- a/srt/entrypoints/openai/serving_chat.py	2026-10-27 00:51:37.902329338 -0700
++++ b/srt/entrypoints/openai/serving_chat.py	2026-10-27 00:51:37.905498241 -0700
+@@ -1230,6 +1230,13 @@
+                 or self._should_return_input_ids(request)
+             ),
+         )
++        # Dual-variant selection is a plain routing flag, not a sampling
++        # override: read it straight from the headers so it never depends on
++        # SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.
++        adapted_request.ablit_variant = (
++            raw_request is not None
++            and raw_request.headers.get("x-ablit-variant") == "1"
++        )
+         if (
+             raw_request is not None
+             and envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.get()
+diff -ruN '--exclude=__pycache__' a/srt/layers/ablit_dual.py b/srt/layers/ablit_dual.py
+--- a/srt/layers/ablit_dual.py	1969-12-31 17:00:00.000000000 -0700
++++ b/srt/layers/ablit_dual.py	2026-10-27 00:51:37.905395009 -0700
+@@ -0,0 +1,127 @@
++"""Dual-variant (stock + abliterated) support for DeepSeek-V4.1-Flash.
++
++The abliterated variant is not a second weight set: the overlay removes one direction
++from attention output across layers 10-35, i.e.
++
++    y' = y - lambda_l * (r . y) * r          (r shared, lambda_l per layer)
++
++Measured against the published overlay this reproduces the artifact to within its own
++FP8 quantisation noise (residual 1.96% of |A|, 84% of FP8 bytes identical), so the edit
++can be applied at runtime on top of the unmodified stock weights.
++
++Per-request selection is a per-token mask supplied by the batch; stock traffic gets
++mask 0 and is therefore an exact no-op (y - 0*x is bitwise y).
++"""
++from __future__ import annotations
++
++import json
++import os
++from typing import Optional
++
++import torch
++
++_ARTIFACT = "ablit_direction.safetensors"
++_META = "ablit_direction.json"
++LAYER_LO, LAYER_HI = 10, 35
++
++
++class AblitDirection:
++    """r + per-layer lambda, loaded once per process (per TP rank) from a read-only dir."""
++
++    def __init__(self, path: str):
++        from safetensors.torch import load_file
++
++        with open(os.path.join(path, _META)) as f:
++            meta = json.load(f)
++        order = meta.get("lambda_layer_order") or (meta.get("hook") or {}).get(
++            "lambda_layer_order"
++        )
++        if order is None:
++            tag = meta.get("lambda_layers")
++            order = (
++                list(range(LAYER_LO, LAYER_HI + 1))
++                if tag == f"{LAYER_LO}-{LAYER_HI}"
++                else None
++            )
++        if order != list(range(LAYER_LO, LAYER_HI + 1)):
++            raise ValueError(f"unexpected lambda_layer_order={order!r}")
++
++        t = load_file(os.path.join(path, _ARTIFACT))
++        self.r = t["r"].float()
++        self.lam = t["lambda"].float()
++        if self.lam.numel() != LAYER_HI - LAYER_LO + 1:
++            raise ValueError(f"expected 26 lambdas, got {self.lam.numel()}")
++        if self.r.ndim != 1 or self.r.numel() == 0:
++            raise ValueError("r must be a non-empty vector")
++        self._cache: dict[tuple[str, torch.dtype], torch.Tensor] = {}
++        prov = meta.get("provenance") or {}
++        self.provenance = (
++            f"{prov.get('overlay_repo', '?')}@{prov.get('overlay_revision_short', '?')}"
++            if isinstance(prov, dict)
++            else str(prov)
++        )
++
++    def _vec(self, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
++        key = (str(device), dtype)
++        v = self._cache.get(key)
++        if v is None:
++            v = self.r.to(device=device, dtype=dtype)
++            self._cache[key] = v
++        return v
++
++    def apply(self, y: torch.Tensor, mask: Optional[torch.Tensor], layer: int) -> torch.Tensor:
++        """Masked rank-1 projection. mask=None or all-zero is a bitwise no-op.
++
++        y: [tokens, hidden] attention output. mask: [tokens] bool/float, or None.
++        Graph-safe: static shapes, no host synchronisation, no Python branch on values.
++        """
++        if layer < LAYER_LO or layer > LAYER_HI:
++            return y
++        r = self._vec(y.dtype, y.device)
++        proj = torch.mv(y, r)
++        if mask is not None:
++            # Rows must match: a batch path that shards or tails rows (SP, late-layer bounded
++            # replay) has to slice the mask alongside the hidden states first. Fail loudly with
++            # both sizes instead of a bare broadcast error.
++            if mask.numel() != proj.numel():
++                raise RuntimeError(
++                    f"ablit hook: mask has {mask.numel()} rows but the attention output has "
++                    f"{proj.numel()} (layer {layer}); the batch path sharded or tailed rows "
++                    f"without slicing forward_batch.ablit_mask"
++                )
++            proj = proj * mask.to(proj.dtype)
++        lam = float(self.lam[layer - LAYER_LO])
++        return y - (lam * proj).unsqueeze(-1) * r
++
++    def reference(self, y: torch.Tensor, mask: Optional[torch.Tensor], layer: int) -> torch.Tensor:
++        """fp32 reference used only by tests."""
++        r = self.r.to(y.device)
++        proj = y.float() @ r
++        if mask is not None:
++            proj = proj * mask.float()
++        return (
++            y.float() - float(self.lam[layer - LAYER_LO]) * proj.unsqueeze(-1) * r
++        ).to(y.dtype)
++
++
++_DIR: Optional[AblitDirection] = None
++
++
++def enabled() -> bool:
++    return os.environ.get("DSV41_DUAL_VARIANT", "0") not in ("", "0", "false", "False")
++
++
++def direction() -> Optional[AblitDirection]:
++    global _DIR
++    if not enabled():
++        return None
++    if _DIR is None:
++        _DIR = AblitDirection(os.environ.get("DSV41_ABLIT_DIR", "/ablit"))
++    return _DIR
++
++
++def apply_hook(y: torch.Tensor, mask: Optional[torch.Tensor], layer: int) -> torch.Tensor:
++    d = direction()
++    if d is None:
++        return y
++    return d.apply(y, mask, layer)
+diff -ruN '--exclude=__pycache__' a/srt/managers/io_struct.py b/srt/managers/io_struct.py
+--- a/srt/managers/io_struct.py	2026-10-27 00:51:37.902754973 -0700
++++ b/srt/managers/io_struct.py	2026-10-27 00:51:37.905624338 -0700
+@@ -311,6 +311,10 @@
+     priority: Optional[int] = None
+     # Extra cache key for caller-defined request classification.
+     extra_key: Optional[Union[List[str], str]] = None
++    # Select the abliterated variant of the dual-variant runtime for this
++    # request only. kw_only=True so adding it cannot shift the positional
++    # fields that follow.
++    ablit_variant: bool = field(default=False, kw_only=True)
+ 
+     # Whether to disallow logging for this request (e.g. due to ZDR)
+     no_logs: bool = False
+@@ -961,6 +965,7 @@
+             max_thinking_tokens=self.max_thinking_tokens,
+             priority=self.priority,
+             extra_key=self.extra_key[i] if self.extra_key is not None else None,
++            ablit_variant=self.ablit_variant,
+             cache_salt=(self.cache_salt[i] if self.cache_salt is not None else None),
+             no_logs=self.no_logs,
+             custom_labels=self.custom_labels,
+@@ -1053,6 +1058,9 @@
+     # Extra cache key for caller-defined request classification.
+     extra_key: Optional[str] = None
+ 
++    # Dual-variant selection, forwarded verbatim from GenerateReqInput.
++    ablit_variant: bool = False
++
+     # Whether to disallow logging for this request (e.g. due to ZDR)
+     no_logs: bool = False
+ 
+diff -ruN '--exclude=__pycache__' a/srt/managers/schedule_batch.py b/srt/managers/schedule_batch.py
+--- a/srt/managers/schedule_batch.py	2026-10-27 00:51:37.903194240 -0700
++++ b/srt/managers/schedule_batch.py	2026-10-27 00:51:37.906116518 -0700
+@@ -932,6 +932,18 @@
+ class Req(ReqDllmMixin):
+     """The input and output status of a request."""
+ 
++    def set_ablit_variant(self) -> None:
++        """Mark this request abliterated and namespace its cache identity.
++
++        The variant is part of the cache key (radix / FULL / SWA / compressed-KV
++        pages and L3 prefetch entries all derive from extra_key), so the suffix
++        is applied here, once. Idempotent: repeated calls keep one suffix.
++        """
++        if self.ablit_variant:
++            return
++        self.ablit_variant = True
++        self.extra_key = (self.extra_key or "") + "\x00ablit"
++
+     def __init__(
+         self,
+         rid: str,
+@@ -978,6 +990,7 @@
+         multi_item_delimiter_indices: Optional[List[int]] = None,
+         session_id: Optional[str] = None,
+         cache_salt: Optional[str] = None,
++        ablit_variant: bool = False,
+     ):
+         # Input and output info
+         self.rid = rid
+@@ -1054,6 +1067,10 @@
+             ) + lora_id  # lora_id is concatenated to the extra key
+ 
+         self.extra_key = extra_key
++        # Dual-variant selection: the variant is part of the cache identity.
++        self.ablit_variant = False
++        if ablit_variant:
++            self.set_ablit_variant()
+         self.cache_salt = cache_salt or None
+         self.lora_id = lora_id
+         self.routing_key = routing_key
+diff -ruN '--exclude=__pycache__' a/srt/managers/scheduler.py b/srt/managers/scheduler.py
+--- a/srt/managers/scheduler.py	2026-10-27 00:51:37.903076095 -0700
++++ b/srt/managers/scheduler.py	2026-10-27 00:51:37.905854612 -0700
+@@ -2794,6 +2794,7 @@
+                 ),
+                 routing_key=recv_req.routing_key,
+                 extra_key=recv_req.extra_key,
++                ablit_variant=recv_req.ablit_variant,
+                 cache_salt=recv_req.cache_salt,
+                 http_worker_ipc=recv_req.http_worker_ipc,
+                 dllm_config=self.dllm_config,
+@@ -2847,6 +2848,11 @@
+                 eos_token_ids=self.model_config.hf_eos_token_id,
+                 disagg_mode=self.disaggregation_mode,
+             )
++            if recv_req.ablit_variant:
++                # Session-side Req construction lives outside this module and
++                # cannot see the flag; mark it here so the cache key is
++                # namespaced too.
++                req.set_ablit_variant()
+             if self.enable_session_radix_cache:
+                 req.session_generation = self.tree_cache.ensure_session_generation(
+                     session_id
+diff -ruN '--exclude=__pycache__' a/srt/managers/tokenizer_manager.py b/srt/managers/tokenizer_manager.py
+--- a/srt/managers/tokenizer_manager.py	2026-10-27 00:51:37.902910782 -0700
++++ b/srt/managers/tokenizer_manager.py	2026-10-27 00:51:37.905696755 -0700
+@@ -1465,6 +1465,7 @@
+                 disagg_prefill_dp_rank=obj.disagg_prefill_dp_rank,
+                 priority=obj.priority,
+                 extra_key=obj.extra_key,
++                ablit_variant=obj.ablit_variant,
+                 cache_salt=obj.cache_salt,
+                 routing_key=obj.routing_key,
+                 token_type_ids=token_type_ids,
+diff -ruN '--exclude=__pycache__' a/srt/model_executor/cuda_graph_buffer_registry.py b/srt/model_executor/cuda_graph_buffer_registry.py
+--- a/srt/model_executor/cuda_graph_buffer_registry.py	2026-10-27 00:51:37.903532547 -0700
++++ b/srt/model_executor/cuda_graph_buffer_registry.py	2026-10-27 00:51:37.906604602 -0700
+@@ -539,6 +539,9 @@
+         triggers an illegal memory access (issue #24361).
+       - ``input_ids`` -> FOREACH_COPY: head ``[:raw_n]`` is overwritten by the
+         copy and the padded tail is not read.
++      - ``ablit_mask`` -> ZERO, plus a post_fill clear when the batch carries
++        no mask (None == stock), so a stock batch never inherits an earlier
++        abliterated batch's mask.
+ 
+     ``custom_mask`` / ``next_token_logits_buffer`` / ``input_embeds`` are not
+     registered here — they are not per-replay FB copies (allocated and written
+@@ -562,6 +565,23 @@
+     def _bs(bs: int, _mt: int) -> Tuple[int, ...]:
+         return (bs,)
+ 
++    # Dual-variant (ab)literation mask (sglang.srt.layers.ablit_dual).
++    # fill_from skips a slot whose FB attribute is None, which would leave
++    # the previous iteration's mask in the head, so clear it explicitly:
++    # absence means stock, and stock must be a bitwise no-op. Presence
++    # check only (no values read, no sync), so replay stays graph-safe.
++    def _clear_absent_ablit_mask(buf, fb, _ctx):
++        if getattr(fb, "ablit_mask", None) is None:
++            buf.zero_()
++
++    # With the overlay off nothing reads the mask, so skip the per-replay
++    # clear and leave the allocation-time zeros untouched.
++    from sglang.srt.layers.ablit_dual import enabled as _ablit_enabled
++
++    _clear_on_absent_mask = (
++        _clear_absent_ablit_mask if _ablit_enabled() else None
++    )
++
+     slots = [
+         GraphSlot("input_ids", _tokens, torch.int64, axis="tokens"),
+         GraphSlot(
+@@ -610,6 +630,16 @@
+             slice_fn=lambda buf, n: buf[:, :n],
+             padding_policy=PaddingPolicy.ZERO,
+         ),
++        # Padded rows must stay 0 so a padding bucket never applies the hook
++        # to junk tokens; the head is filled from the FB mask when present.
++        GraphSlot(
++            "ablit_mask",
++            _tokens,
++            torch.bool,
++            axis="tokens",
++            padding_policy=PaddingPolicy.ZERO,
++            post_fill=_clear_on_absent_mask,
++        ),
+     ]
+     if enable_mamba_track:
+         slots.append(
+diff -ruN '--exclude=__pycache__' a/srt/model_executor/forward_batch_info.py b/srt/model_executor/forward_batch_info.py
+--- a/srt/model_executor/forward_batch_info.py	2026-10-27 00:51:37.903359234 -0700
++++ b/srt/model_executor/forward_batch_info.py	2026-10-27 00:51:37.906412120 -0700
+@@ -28,6 +28,8 @@
+ from __future__ import annotations
+ 
+ import hashlib
++import logging
++import os
+ import warnings
+ from dataclasses import dataclass
+ from enum import IntEnum, auto
+@@ -104,6 +106,12 @@
+     return uneven_token_count
+ 
+ 
++logger = logging.getLogger(__name__)
++
++# One-shot guard for the single informational dual-variant mask log line.
++_ABLIT_MASK_LOGGED = False
++
++
+ class ForwardMode(IntEnum):
+     # Extend a sequence. The KV cache of the beginning part of the sequence is already computed (e.g., system prompt).
+     # It is also called "prefill" in common terminology.
+@@ -514,6 +522,10 @@
+ 
+     minimax_m3_precached_sparse_layers: Optional[Set[int]] = None
+ 
++    # Dual-variant hook: per-token bool mask ordered exactly like input_ids.
++    # None means no request in this batch selects the abliterated variant.
++    ablit_mask: Optional[torch.Tensor] = None
++
+     # === Forward-derived (built in init_new on the forward stream; FB-owned) ===
+     # Position information
+     positions: torch.Tensor = None
+@@ -970,6 +982,12 @@
+                 ret.positions = positions
+             ret.extend_logprob_start_lens_cpu = extend_logprob_start_lens
+ 
++        ret._init_ablit_mask(batch, model_runner, device)
++        if os.environ.get("DSV41_ABLIT_DEBUG") == "1":
++            assert ret.ablit_mask is None or ret.ablit_mask.numel() == (
++                ret.input_ids.numel()
++            )
++
+         if model_runner.ngram_embedding_manager.enabled:
+             ret._init_ngram_embedding_info(batch, device)
+ 
+@@ -1053,6 +1071,59 @@
+                 pin_memory=is_pin_memory_available(batch.device),
+             ).to(batch.device, non_blocking=True)
+ 
++    def _init_ablit_mask(
++        self, batch: ScheduleBatch, model_runner: ModelRunner, device: torch.device
++    ) -> None:
++        """Per-token dual-variant mask, ordered exactly like ``input_ids``.
++
++        Extend forwards concatenate one block per request in request order, so
++        the rows are the same ``extend_seq_lens`` blocks the input rows were
++        built from. Decode forwards (including DSpark target verify) carry one
++        slot per request widened to the runner's static per-slot decode width.
++        Stays None when no request selects the abliterated variant, so stock
++        traffic allocates nothing here.
++        """
++        from sglang.srt.layers.ablit_dual import enabled as _ablit_enabled
++
++        if not _ablit_enabled():
++            return
++        if not any(req.ablit_variant for req in batch.reqs):
++            return
++
++        flags = torch.tensor(
++            [req.ablit_variant for req in batch.reqs],
++            dtype=torch.bool,
++            pin_memory=is_pin_memory_available(device),
++        ).to(device, non_blocking=True)
++        if self.extend_seq_lens is not None:
++            # Extend: per-request extend block lengths, in request order.
++            assert self.extend_seq_lens.shape[0] == len(batch.reqs)
++            self.ablit_mask = flags.repeat_interleave(
++                self.extend_seq_lens.to(dtype=torch.long)
++            )
++        else:
++            # Decode / target verify: one row per request, repeated by the
++            # static per-slot width this forward runs at.
++            self.ablit_mask = flags.repeat_interleave(
++                int(model_runner.decode_num_tokens_per_req())
++            )
++
++        numel = self.input_ids.numel() if self.input_ids is not None else 0
++        assert self.ablit_mask.numel() == numel, (
++            f"ablit_mask has {self.ablit_mask.numel()} rows but input_ids has "
++            f"{numel}"
++        )
++
++        global _ABLIT_MASK_LOGGED
++        if not _ABLIT_MASK_LOGGED:
++            _ABLIT_MASK_LOGGED = True
++            logger.info(
++                "dual-variant: ablit mask built (%d of %d tokens selected, mode=%s)",
++                int(self.ablit_mask.sum()),
++                numel,
++                self.forward_mode.name,
++            )
++
+     def set_local_num_token_non_padded(self, *, sharded: bool) -> None:
+         """Derive the LOCAL num_token_non_padded from the invariant GLOBAL scalar.
+ 
+@@ -1572,6 +1643,9 @@
+         # padding
+         self._original_num_tokens = self.positions.shape[0]
+         self.input_ids = self._pad_tensor_to_size(self.input_ids, num_tokens)
++        if self.ablit_mask is not None:
++            # Keep the dual-variant mask row-aligned with the padded input_ids.
++            self.ablit_mask = self._pad_tensor_to_size(self.ablit_mask, num_tokens)
+         if self.input_embeds is not None:
+             # Keep token-aligned inputs consistent after padding.
+             self.input_embeds = self._pad_tensor_to_size(self.input_embeds, num_tokens)
+diff -ruN '--exclude=__pycache__' a/srt/model_executor/input_buffers.py b/srt/model_executor/input_buffers.py
+--- a/srt/model_executor/input_buffers.py	1969-12-31 17:00:00.000000000 -0700
++++ b/srt/model_executor/input_buffers.py	2026-10-27 00:51:37.906352008 -0700
+@@ -0,0 +1,102 @@
++from __future__ import annotations
++
++import dataclasses
++from dataclasses import dataclass, fields
++from typing import Collection, Dict, Tuple
++
++import torch
++
++from sglang.srt.utils import is_npu
++
++# Process-wide pool keyed by (name, numel, dtype, device); see share_input_buffer.
++_PoolKey = Tuple[str, int, torch.dtype, torch.device]
++_forward_input_buffer_pool: Dict[_PoolKey, torch.Tensor] = {}
++
++
++def share_input_buffer(name: str, new_buffer: torch.Tensor) -> torch.Tensor:
++    """Coalesce a buffer by ``(name, size, dtype, device)`` into the
++    process-wide input-buffer pool.
++
++    Distinct callers that request the same field ``name`` with the same
++    size/dtype/device share one physical allocation (and therefore one
++    ``data_ptr``): the first registrant's buffer becomes canonical and every
++    later identical request is returned as a view aliased onto it. Requests
++    that differ in size get their own allocation — they never reuse or displace
++    an existing entry — so the sharing *structure* is independent of
++    registration order and no already-captured buffer is ever repointed.
++
++    This pool is process-wide and governs *every* ``share_buffers()`` caller —
++    including graph runners not yet on the registry (the speculative draft /
++    draft-extend / frozen-kv-mtp / multi-layer-eagle runners), which register
++    identically-named ``input_ids`` / ``positions`` / ``out_cache_loc`` /
++    ``mrope_positions``. Cross-runner sharing is safe because those buffers are
++    filled immediately before each replay and the forwards that use them are
++    sequential / mutually exclusive.
++    """
++    key: _PoolKey = (name, new_buffer.numel(), new_buffer.dtype, new_buffer.device)
++    canonical = _forward_input_buffer_pool.get(key, None)
++    if canonical is None:
++        _forward_input_buffer_pool[key] = new_buffer
++        canonical = new_buffer
++    return canonical.as_strided(new_buffer.size(), new_buffer.stride())
++
++
++# Values that index the rope table, the KV pool, req_to_token, or the mamba
++# state pool, so stale content is unsafe to execute. build_decode_registry
++# asserts its ZERO-policy slots against this set. ``ablit_mask`` indexes
++# nothing, but a stale non-zero entry silently keeps the dual-variant hook
++# armed on stock tokens, so it must reset with them (mid-serving recapture).
++INDEX_SEMANTIC_BUFFERS = frozenset(
++    {
++        "positions",
++        "mrope_positions",
++        "out_cache_loc",
++        "req_pool_indices",
++        "mamba_track_indices",
++        "mamba_track_mask",
++        "ablit_mask",
++    }
++)
++
++
++@dataclass
++class ForwardInputBuffers:
++    def reset_index_buffers(self) -> None:
++        """Zero the index-semantic buffers this set declares."""
++        for f in fields(self):
++            if f.name not in INDEX_SEMANTIC_BUFFERS:
++                continue
++            buffer = getattr(self, f.name)
++            if buffer is not None:
++                buffer.zero_()
++
++    def share_buffers(self, *, exclude: Collection[str] = ()):
++        # disable share input buffer on npu due to accuracy issue
++        if is_npu():
++            return
++
++        for f in fields(self):
++            name = f.name
++            if name in exclude:
++                continue
++            buffer = getattr(self, name)
++
++            if buffer is None:
++                continue
++
++            if dataclasses.is_dataclass(buffer):
++                buffer = vars(buffer)
++
++            if isinstance(buffer, dict):
++                for sub_name, sub_buffer in buffer.items():
++                    assert isinstance(sub_buffer, torch.Tensor), (
++                        f"Field {name}.{sub_name} is expected to be a torch.Tensor, but got {type(sub_buffer)}."
++                    )
++                    buffer[sub_name] = share_input_buffer(
++                        f"{name}.{sub_name}", sub_buffer
++                    )
++            else:
++                assert isinstance(buffer, torch.Tensor), (
++                    f"Field {name} is expected to be a torch.Tensor, a dict of torch.Tensor, or a dataclass of torch.Tensor, but got {type(buffer)}."
++                )
++                setattr(self, name, share_input_buffer(name, buffer))
+diff -ruN '--exclude=__pycache__' a/srt/model_executor/runner/decode_cuda_graph_runner.py b/srt/model_executor/runner/decode_cuda_graph_runner.py
+--- a/srt/model_executor/runner/decode_cuda_graph_runner.py	2026-10-27 00:51:37.903599187 -0700
++++ b/srt/model_executor/runner/decode_cuda_graph_runner.py	2026-10-27 00:51:37.906710634 -0700
+@@ -184,6 +184,8 @@
+         forward_mode=capture_forward_mode,
+         actual_forward_mode=forward_batch.forward_mode,
+         input_ids=buffers.input_ids[:num_tokens],
++        # Same static buffer the captured graph reads (offset-0 slice).
++        ablit_mask=buffers.ablit_mask[:num_tokens],
+         positions=buffers.positions[:num_tokens],
+         req_pool_indices=buffers.req_pool_indices[:bs],
+         seq_lens=buffers.seq_lens[:bs],
+@@ -419,7 +421,10 @@
+                 self.model_runner.get_pp_proxy_residual_num_blocks()
+             ),
+         )
+-        self.buffers.share_buffers()
++        # ablit_mask stays runner-private: draft batches carry no mask, and a
++        # pooled alias would let the target's per-token mask leak into the
++        # draft graph's captured read address.
++        self.buffers.share_buffers(exclude={"ablit_mask"})
+         # FB-shared slot registry adopting DecodeInputBuffers storage (same
+         # physical tensors, stable data_ptr for capture vs replay). Provides
+         # the unified fill_from / slot access surface for capture/replay.
+@@ -960,6 +965,9 @@
+             forward_mode=self.capture_forward_mode,
+             batch_size=bs,
+             input_ids=input_ids,
++            # Zero mask: the captured graph bakes this buffer's address and
++            # records the mask read, so stock capture stays a no-op.
++            ablit_mask=_slot("ablit_mask"),
+             req_pool_indices=req_pool_indices,
+             seq_lens=seq_lens,
+             seq_lens_cpu=seq_lens_cpu,
+diff -ruN '--exclude=__pycache__' a/srt/model_executor/runner_utils/buffers.py b/srt/model_executor/runner_utils/buffers.py
+--- a/srt/model_executor/runner_utils/buffers.py	2026-10-27 00:51:37.903484674 -0700
++++ b/srt/model_executor/runner_utils/buffers.py	2026-10-27 00:51:37.906541353 -0700
+@@ -112,6 +112,9 @@
+     ngram_embedding_info: Optional[NgramEmbeddingInfo]
+     rids_int: Optional[torch.Tensor]
+     bootstrap_room_ids_int: Optional[torch.Tensor]
++    # Per-token dual-variant hook mask: zeros == stock traffic. Bound by the
++    # decode registry's "ablit_mask" slot and refreshed per replay.
++    ablit_mask: torch.Tensor
+ 
+     @classmethod
+     def create(
+@@ -139,6 +142,9 @@
+     ) -> DecodeInputBuffers:
+         with torch.device(device):
+             input_ids = torch.zeros((max_num_token,), dtype=torch.int64)
++            # Token-axis like input_ids: one allocation at max_num_token,
++            # sliced per bucket; only the live prefix is ever rewritten.
++            ablit_mask = torch.zeros((max_num_token,), dtype=torch.bool)
+             input_embeds = torch.zeros((max_num_token, hidden_size), dtype=dtype)
+             req_pool_indices = torch.zeros((max_bs,), dtype=torch.int64)
+             seq_lens = torch.full((max_bs,), seq_len_fill_value, dtype=torch.int64)
+@@ -223,6 +229,7 @@
+ 
+         return cls(
+             input_ids=input_ids,
++            ablit_mask=ablit_mask,
+             input_embeds=input_embeds,
+             req_pool_indices=req_pool_indices,
+             seq_lens=seq_lens,
+diff -ruN '--exclude=__pycache__' a/srt/models/deepseek_v4.py b/srt/models/deepseek_v4.py
+--- a/srt/models/deepseek_v4.py	2026-10-27 00:51:37.903694436 -0700
++++ b/srt/models/deepseek_v4.py	2026-10-27 00:51:37.906833579 -0700
+@@ -42,6 +42,13 @@
+ )
+ from sglang.srt.compilation.compilation_config import register_split_op
+ from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
++from sglang.srt.layers.ablit_dual import (
++    LAYER_HI as _ABLIT_HI,
++    LAYER_LO as _ABLIT_LO,
++    apply_hook as _ablit_apply_hook,
++    direction as _ablit_direction,
++    enabled as _ablit_enabled,
++)
+ from sglang.srt.distributed import (
+     get_pp_group,
+     get_tp_group,
+@@ -918,6 +925,17 @@
+             tp_size=self.attn_tp_size,
+         )
+ 
++        # Dual-variant runtime: layers 10-35 carry the abliteration rank-1 projection.
++        # Constant per module, so the per-token mask needs no Python branch in forward.
++        self._ablit_on = bool(_ablit_enabled()) and _ABLIT_LO <= layer_id <= _ABLIT_HI
++        if self._ablit_on:
++            _d = _ablit_direction()
++            if int(getattr(self, "hidden_size", 0)) != int(_d.r.numel()):
++                raise ValueError(
++                    f"ablit direction dim {int(_d.r.numel())} != hidden_size "
++                    f"{getattr(self, 'hidden_size', None)}"
++                )
++
+         from sglang.kernels.ops.attention.deepseek_v4_rope import precompute_freqs_cis
+ 
+         rope_theta, rope_scaling = get_rope_config(config)
+@@ -2468,6 +2486,13 @@
+             o if isinstance(o, Mxfp8SwizzledInput) else o.flatten(1),
+             skip_all_reduce=mhc is not None,
+         )
++        if self._ablit_on:
++            # Rank-1 abliteration, per-token masked. Applied to the rank-local partial
++            # before the fused all-reduce: exact, because y -> y - lam (r.y) r is linear.
++            # An all-zero mask is a bitwise no-op, so stock requests are unchanged.
++            o = _ablit_apply_hook(
++                o, getattr(forward_batch, "ablit_mask", None), self.layer_id
++            )
+         if mhc is not None:
+             from sglang.kernels.ops.communication.all_reduce_mhc import (
+                 all_reduce_mhc_norm,
+@@ -4279,6 +4304,10 @@
+                     tail.rows(input_ids),
+                     tail.rows(input_ids_global),
+                 )
++                if getattr(forward_batch, "ablit_mask", None) is not None:
++                    # Bounded replay rewrites the token set at the late-layer boundary;
++                    # the mask must follow the same row selection as the hidden states.
++                    forward_batch.ablit_mask = tail.rows(forward_batch.ablit_mask)
+                 positions = tail.positions
+                 if hash_ids is not None:
+                     hash_ids = tail.rows(hash_ids)

@@ -107,14 +107,14 @@ DEBUG_DUMP = os.environ.get("DSV41_PREFILL_SP_DEBUG_DUMP", "").strip()
 # tail) and #45301 (MQALayer.forward takes its zeroed padded-query rows from a shared buffer;
 # wrapped here, not copied). tests/test_adapter_engine_pins.py checks these in the image build.
 _EXPECTED = {
-    "v4.DeepseekV4Model._forward_layers_hc_pre_from_prev": "2675ec391cc23f1b",
+    "v4.DeepseekV4Model._forward_layers_hc_pre_from_prev": "256a61f4fffa21ea",  # dual-variant patch: mask hook + tail mask slice
     "v4.DeepseekV4DecoderLayer.forward_hc_pre_from_prev": "49dc092d369923cf",
     "v4.DeepseekV4DecoderLayer._hc_combine": "da5688eff1cf6fab",
     "v4.DeepseekV4DecoderLayer._hc_mix_stats": "0a6edf4b45cd160b",
     "v4.DeepseekV4DecoderLayer.hc_post": "8adb8062e8e66c31",
     "v4.DeepseekV4DecoderLayer._run_moe_ffn_dp_sync": "065622659105f3fe",
     "v4.DeepseekV4Model.forward": "3ab2a4745377b83b",
-    "v4.MQALayer.forward": "167b94e235b3eab6",
+    "v4.MQALayer.forward": "9d54c8f1df58f972",  # dual-variant patch: mask hook + tail mask slice
     "v2.DeepseekV2MoE.forward": "d931dfa4d2acacd8",
     "v2.DeepseekV2MoE.forward_normal": "9da361af16dafbec",
     "engram.Engram.forward": "841b358015e044b8",
@@ -700,10 +700,14 @@ def _sp_forward_layers(self, p, positions, hidden_states, forward_batch, input_i
         tail = attn_backend.tail_forward_metadata.late_layer_tail
     in_region = True
     R = hidden_states[p.lo:p.hi] if p.sharded else hidden_states
+    # dual-variant: NO shard slice here. The attention/MoE wrappers gather the row shard
+    # back to full rows before they run (see _make_attn_forward: xf = _gather_rows(p, x)),
+    # so the hook at wo_b still sees p.rows rows and needs the full mask.
     ids_rows = None
     saved_full = None
     prev_pre = None
     precomputed_attn = None
+    _ablit_mask0 = getattr(forward_batch, "ablit_mask", None)
     _ctx.plan = p
     try:
         for i in range(self.start_layer, self.end_layer):
@@ -736,6 +740,11 @@ def _sp_forward_layers(self, p, positions, hidden_states, forward_batch, input_i
                     R, prev_pre = tail.rows(R), tail.rows(prev_pre)
                 input_ids, input_ids_global = tail.rows(input_ids), tail.rows(input_ids_global)
                 positions = tail.positions
+                if getattr(forward_batch, "ablit_mask", None) is not None:
+                    # below the late-layer boundary only the tail's rows are live
+                    # From this layer on only the tail's rows exist (128 of 8192 for a
+                    # full chunk), so the mask follows the same row selection as R.
+                    forward_batch.ablit_mask = tail.rows(forward_batch.ablit_mask)
                 if hash_ids is not None:
                     hash_ids = tail.rows(hash_ids)
             engram = self.layers[i].engram
@@ -785,6 +794,9 @@ def _sp_forward_layers(self, p, positions, hidden_states, forward_batch, input_i
             precomputed_attn = next_input[0] if next_input else None
     finally:
         _ctx.plan = None
+        if _ablit_mask0 is not None:
+            # the mask is consumed only inside this loop; leave the batch as we found it
+            forward_batch.ablit_mask = _ablit_mask0
     if saved_full is not None:
         attn_backend.exit_late_layer_tail(saved_full, forward_batch)
         return R, prev_pre, tail

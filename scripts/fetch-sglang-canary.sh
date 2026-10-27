@@ -29,6 +29,8 @@ PATCH_DSV41_FUSED_WINDOW_LAYOUT="$ROOT/patches/sglang-45726-fused-window-layout-
 PATCH_DSV41_IDLE_SWA_STORE="$ROOT/patches/sglang-45586-45699-idle-swa-store.patch"
 PATCH_DSV41_DRAFT_METADATA_GLUE="$ROOT/patches/sglang-45450-draft-metadata-glue.patch"
 PATCH_GREEDY_FLAGS_REFRESH="$ROOT/patches/sglang-44923-greedy-flags-refresh.patch"
+PATCH_DUAL_VARIANT="$ROOT/patches/sglang-dual-variant-abliteration.patch"
+DUAL_VARIANT_PATCH_SHA256="d454a4c2feee6d2fbfccedb63b8e91760aa992764fd8a4821d62cc6fcbb3f0bb"
 PARALLEL_ENCODE_REF="fba3ad4b1f4563143f3352beb148c4c28d4be9ed"
 PARALLEL_ENCODE_SHA256="722cc41b1096977af3bda6c505e7c629b9b8f7308174cda1c7d2c44f9b54c097"
 PARALLEL_ENCODE_TEST_SHA256="fa1adf5c9b51fdf25cb7998e963a7de905c58cb5aa35395cf16d6c75422ecf9e"
@@ -252,6 +254,11 @@ patch --dry-run --silent --fuzz=0 -p1 < "$PATCH_GREEDY_FLAGS_REFRESH"
 patch --silent --fuzz=0 -p1 < "$PATCH_GREEDY_FLAGS_REFRESH"
 python3 "$ROOT/scripts/verify_sglang_greedy_flags_refresh.py" "$DST/python"
 python3 "$ROOT/scripts/test_sglang_greedy_flags_refresh.py" "$DST/python"
+echo "applying dual-variant abliteration support (stock + abliterated names, one engine) ..."
+printf '%s  %s\n' "$DUAL_VARIANT_PATCH_SHA256" "$PATCH_DUAL_VARIANT" | shasum -a 256 -c -
+patch --dry-run --silent --fuzz=0 -p1 < "$PATCH_DUAL_VARIANT"
+patch --silent --fuzz=0 -p1 < "$PATCH_DUAL_VARIANT"
+python3 "$ROOT/scripts/verify_sglang_dual_variant.py" "$DST/python"
 echo "$REF" > REF
 printf '%s\n' \
   "41303 ed8c3139f1f643544b68102cf8c44504e5e55e3d" \
@@ -279,6 +286,7 @@ printf '%s\n' \
   "45726 $DSV41_FUSED_WINDOW_LAYOUT_REF helper-sha256=$DSV41_FUSED_WINDOW_LAYOUT_SHA256 integration-patch-sha256=$DSV41_FUSED_WINDOW_LAYOUT_PATCH_SHA256" \
   "45586 $DSV41_IDLE_WINDOW_REF 45699 $DSV41_IDLE_STORE_REF patch-sha256=$DSV41_IDLE_SWA_STORE_PATCH_SHA256" \
   "45450-draft-glue $DSV41_DRAFT_METADATA_GLUE_REF patch-sha256=$DSV41_DRAFT_METADATA_GLUE_PATCH_SHA256" \
-  "44923 $GREEDY_FLAGS_REFRESH_REF patch-sha256=$GREEDY_FLAGS_REFRESH_PATCH_SHA256" > PATCHES
+  "44923 $GREEDY_FLAGS_REFRESH_REF patch-sha256=$GREEDY_FLAGS_REFRESH_PATCH_SHA256" \
+  "dual-variant patch-sha256=$DUAL_VARIANT_PATCH_SHA256" > PATCHES
 du -sh python
-echo "staged $DST/python (ref $REF + SGLang #41303/#42901/#44001/#41259/#45410/#43549/#44751/#45301/#40424/#43448/#45457/#45458/#45663/#45518/#45450/#45630/#45745/#45793/#45794/#45762/#45804/#45579/#45726/#45586/#45699/#45450-draft-glue/#44923 backports); now: docker build -f Dockerfile.canary -t dsv41-4x-spark:canary ."
+echo "staged $DST/python (ref $REF + SGLang #41303/#42901/#44001/#41259/#45410/#43549/#44751/#45301/#40424/#43448/#45457/#45458/#45663/#45518/#45450/#45630/#45745/#45793/#45794/#45762/#45804/#45579/#45726/#45586/#45699/#45450-draft-glue/#44923 backports + dual-variant abliteration); now: docker build -f Dockerfile.canary -t dsv41-4x-spark:canary ."
